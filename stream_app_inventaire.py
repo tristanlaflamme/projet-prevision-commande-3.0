@@ -9,6 +9,7 @@ import unicodedata
 import random, math
 from collections import defaultdict
 from urllib.parse import urlencode
+import calendar
 
 DB_FILE = "inventaire_temp.db"
 
@@ -221,6 +222,27 @@ def ensure_po_tables():
     conn.commit()
     conn.close()
 
+def ensure_production_tables():
+    conn = open_conn(); cur = conn.cursor()
+    # Heures standard par produit (temps de fabrication d'une unité)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS product_std (
+            id_produit TEXT PRIMARY KEY,
+            heures_unite REAL DEFAULT 1
+        )""")
+    # Calendrier de prod (plan lissé)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS production_calendar (
+            annee INTEGER,
+            mois  INTEGER,            -- 1..12
+            id_produit TEXT,
+            qte INTEGER,
+            heures REAL,
+            PRIMARY KEY (annee, mois, id_produit)
+        )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_prodcal_mois ON production_calendar(annee, mois)")
+    conn.commit(); conn.close()
+
 
 # >>> AJOUT : réception auto des lignes dont la date prévue est passée
 def auto_reception_commandes():
@@ -286,6 +308,116 @@ def get_on_order_summary():
     df["en_attente"] = df["en_attente"].fillna(0).astype(int)
     df["prochaine_reception"] = df["prochaine_reception"].fillna("")
     return df
+
+
+def _load_std_hours() -> dict:
+    """map id_produit -> heures_unite (fallback 1.0 si manquant)"""
+    conn = open_conn()
+    try:
+        df = pd.read_sql("SELECT id_produit, heures_unite FROM product_std", conn)
+    finally:
+        conn.close()
+    m = dict(df.values) if not df.empty else {}
+    return m
+
+def _save_std_hours(df_std: pd.DataFrame):
+    conn = open_conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM product_std")
+    cur.executemany("INSERT INTO product_std (id_produit, heures_unite) VALUES (?,?)",
+                    [(r["id_produit"], float(r["heures_unite"])) for _, r in df_std.iterrows()])
+    conn.commit(); conn.close()
+
+def _monthly_capacity(year:int, default_hours:float=160.0) -> pd.DataFrame:
+    """Capacité initiale (heures) par mois, éditable ensuite."""
+    return pd.DataFrame({"annee": [year]*12,
+                         "mois": list(range(1,13)),
+                         "heures_disponibles": [default_hours]*12})
+
+def _baseline_annual_demand(year:int, growth_pct:float=0.0) -> pd.DataFrame:
+    """
+    Annualise la demande par produit à partir de l'historique (moyenne mensuelle * 12),
+    puis applique un % de croissance.
+    """
+    conn = open_conn()
+    try:
+        hist = pd.read_sql("SELECT id_produit, quantite, date_commande FROM historique_commandes", conn)
+    finally:
+        conn.close()
+    if hist.empty:
+        return pd.DataFrame(columns=["id_produit","annual_units"])
+    hist["date_commande"] = pd.to_datetime(hist["date_commande"], errors="coerce")
+    hist = hist.dropna(subset=["date_commande"])
+    hist["mois"] = hist["date_commande"].dt.to_period("M")
+    par_mois = hist.groupby(["id_produit","mois"]).quantite.sum().reset_index()
+    moy = par_mois.groupby("id_produit").quantite.mean()
+    df = moy.reset_index().rename(columns={"quantite":"annual_units"})
+    df["annual_units"] = (df["annual_units"]*12.0*(1.0+growth_pct/100.0)).round().astype(int)
+    return df
+
+def _level_load_schedule(annual_units: dict, std_hours: dict, cap_by_month: dict) -> pd.DataFrame:
+    """
+    Lissage simple capacité→demande :
+      - pour m=1..12, on répartit la capacité du mois entre produits, en priorité ceux avec
+        beaucoup de "heures restantes" (remaining_units * heures_unite).
+      - greedy : on alloue le max d'unités entières possible sans dépasser la capacité.
+    Retourne df(mois,id_produit,qte,heures).
+    """
+    rem_units = {p:int(max(0,annual_units.get(p,0))) for p in annual_units.keys()}
+    # si des produits sans std_hours: 1.0h par défaut
+    h_un = {p: float(std_hours.get(p, 1.0)) for p in rem_units.keys()}
+
+    rows = []
+    for m in range(1,13):
+        cap = float(cap_by_month.get(m, 0.0))
+        if cap <= 0 or sum(rem_units.values()) == 0:
+            continue
+
+        # ordre par poids restant (heures) décroissant
+        order = sorted(rem_units.keys(), key=lambda p: rem_units[p]*h_un[p], reverse=True)
+
+        # greedy : pour chaque produit, on prend le maximum d'unités entières qui rentre
+        for p in order:
+            if rem_units[p] <= 0 or cap <= 0:
+                continue
+            hu = max(h_un[p], 1e-6)
+            max_units = min(rem_units[p], int(cap // hu))
+            if max_units > 0:
+                rows.append({"mois": m, "id_produit": p,
+                             "qte": max_units, "heures": max_units*hu})
+                rem_units[p] -= max_units
+                cap -= max_units*hu
+
+        # si il reste un peu de capacité et des unités restantes, on distribue 1 par 1
+        if cap >= 1e-6 and sum(rem_units.values()) > 0:
+            # priorité toujours au plus "lourd"
+            for p in order:
+                if rem_units[p] <= 0:
+                    continue
+                if h_un[p] <= cap + 1e-6:  # on peut caser 1 unité
+                    rows.append({"mois": m, "id_produit": p,
+                                 "qte": 1, "heures": h_un[p]})
+                    rem_units[p] -= 1
+                    cap -= h_un[p]
+                if cap < 1e-6:
+                    break
+
+    return pd.DataFrame(rows)
+
+def _product_to_pieces_map() -> dict:
+    """map id_produit -> set([id_piece, ...]) via sous_assemblages/pieces."""
+    conn = open_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT sa.id_produit, pi.id_piece
+            FROM sous_assemblages sa
+            JOIN pieces pi ON pi.id_sous_assemblage = sa.id_sous_assemblage
+        """, conn)
+    finally:
+        conn.close()
+    m = {}
+    for _, r in df.iterrows():
+        m.setdefault(r["id_produit"], set()).add(r["id_piece"])
+    return m
 
 
 # ── FTS: index plein-texte (sécurisé si FTS5 absent) ─────────────────────────
@@ -381,7 +513,8 @@ def search_ids_from_fts(q: str) -> list[str]:
 
 if "db_init_done" not in st.session_state:
     ensure_db_indexes()
-    ensure_po_tables()          # <<< AJOUT : crée les tables commandes si absentes
+    ensure_po_tables()
+    ensure_production_tables()     # <<< AJOUT
     st.session_state["db_init_done"] = True
 
 
@@ -1858,6 +1991,7 @@ onglets = st.tabs([
     "✍️ Prévision manuelle (par produit)",
     "🧾 Bon de commande",
     "🔮 Simulation annuelle",
+    "📅 Calendrier de production",   # <<< AJOUT
     "🛒 Passer une commande"  # <<< AJOUT
 ])
 
@@ -2829,8 +2963,107 @@ with onglets[3]:
         )
 
 
-# ============ ONGLET 5 : Passer une commande ============
-with onglets[4]:
+# ============ ONGLET : 📅 Calendrier de production ============
+with onglets[4]:   # attention: l'indice doit correspondre à ta liste réelle
+    st.subheader("📅 Calendrier de production (lissage annuel)")
+    colA, colB, colC = st.columns(3)
+    with colA:
+        annee = st.number_input("Année planifiée", min_value=2024, value=datetime.today().year, step=1, key="prodcal_annee")
+    with colB:
+        croissance = st.number_input("Croissance vs historique (%)", value=0.0, step=1.0, key="prodcal_growth")
+    with colC:
+        cap_default = st.number_input("Capacité standard par mois (heures)", min_value=0.0, value=160.0, step=10.0, key="prodcal_capdef")
+
+    # 1) Demande annuelle par produit (baseline historique)
+    df_dmd = _baseline_annual_demand(int(annee), float(croissance))
+    if df_dmd.empty:
+        st.info("Aucun historique : renseigne la demande annuelle manuellement dans le tableau ci-dessous.")
+        # créer un squelette avec tous les produits
+        conn = open_conn(); df_prod = pd.read_sql("SELECT id_produit, nom_produit FROM produits", conn); conn.close()
+        df_dmd = df_prod.copy(); df_dmd["annual_units"] = 0
+
+    # 2) Heures standard par produit (éditable)
+    std_map = _load_std_hours()
+    conn = open_conn(); df_prod = pd.read_sql("SELECT id_produit, nom_produit FROM produits", conn); conn.close()
+    if std_map:
+        df_std = pd.DataFrame({"id_produit": list(std_map.keys()),
+                               "heures_unite": list(std_map.values())}).merge(df_prod, on="id_produit", how="right")
+    else:
+        df_std = df_prod.copy(); df_std["heures_unite"] = 1.0
+    st.markdown("#### Heures standard par produit (éditable)")
+    df_std_edit = st.data_editor(df_std[["id_produit","nom_produit","heures_unite"]],
+                                 use_container_width=True, key="prodcal_std_edit")
+    if st.button("💾 Sauvegarder les heures standard", key="prodcal_save_std"):
+        _save_std_hours(df_std_edit[["id_produit","heures_unite"]])
+        st.success("Heures standard sauvegardées.")
+
+    # 3) Capacité mensuelle (éditable)
+    st.markdown("#### Capacité mensuelle (heures, éditable)")
+    df_cap = _monthly_capacity(int(annee), float(cap_default))
+    df_cap = st.data_editor(df_cap, use_container_width=True, key="prodcal_cap_edit")
+
+    # 4) Demande annuelle (éditable)
+    st.markdown("#### Demande annuelle par produit (éditable)")
+    df_dmd = df_dmd.merge(df_prod, on="id_produit", how="right")
+    df_dmd = df_dmd[["id_produit","nom_produit","annual_units"]].fillna({"annual_units":0}).astype({"annual_units":"int64"})
+    df_dmd_edit = st.data_editor(df_dmd, use_container_width=True, key="prodcal_dmd_edit")
+
+    # 5) Lancer le lissage
+    if st.button("▶️ Générer le calendrier lissé", key="prodcal_run"):
+        std_map2 = {r["id_produit"]: float(r["heures_unite"]) for _, r in df_std_edit.iterrows()}
+        dmd_map = {r["id_produit"]: int(r["annual_units"]) for _, r in df_dmd_edit.iterrows()}
+        cap_map = {int(r["mois"]): float(r["heures_disponibles"]) for _, r in df_cap.iterrows()}
+
+        plan = _level_load_schedule(dmd_map, std_map2, cap_map)  # (mois,id_produit,qte,heures)
+
+        if plan.empty:
+            st.warning("Plan vide : vérifie que la demande > 0 et que la capacité > 0.")
+        else:
+            # Enregistrer dans production_calendar (optionnel ; sinon juste afficher)
+            conn = open_conn(); cur = conn.cursor()
+            cur.execute("DELETE FROM production_calendar WHERE annee=?", (int(annee),))
+            cur.executemany("""INSERT INTO production_calendar (annee, mois, id_produit, qte, heures)
+                               VALUES (?,?,?,?,?)""",
+                            [(int(annee), int(r["mois"]), r["id_produit"], int(r["qte"]), float(r["heures"]))
+                             for _, r in plan.iterrows()])
+            conn.commit(); conn.close()
+
+            # Affichage pivot (mois en colonnes)
+            pivot = plan.pivot_table(index="id_produit",
+                                     columns="mois",
+                                     values="qte", aggfunc="sum", fill_value=0).sort_index()
+            st.markdown("#### 📊 Calendrier (unités par mois)")
+            st.dataframe(pivot, use_container_width=True)
+
+            # Résumé charge vs capacité
+            charge = plan.groupby("mois")["heures"].sum().reindex(range(1,13), fill_value=0.0)
+            cap = pd.Series(cap_map).reindex(range(1,13), fill_value=0.0)
+            df_rc = pd.DataFrame({"heures_planifiées": charge, "heures_disponibles": cap})
+            st.markdown("#### ⚖️ Charge vs Capacité (heures)")
+            st.dataframe(df_rc, use_container_width=True)
+
+            # 6) ⇨ Préparer l'achat pièces pour les X prochains mois
+            st.markdown("#### ⇨ Générer les besoins pièces à partir du plan")
+            horizon = st.slider("Horizon (mois) pour alimenter 🛒", 1, 6, 3, 1, key="prodcal_horizon")
+            # map produit->pieces (1:1 par défaut; si tu ajoutes des quantités de nomenclature, on les intégrera ici)
+            p2pcs = _product_to_pieces_map()
+            # besoins pièces cumulés sur l'horizon
+            df_hor = plan[plan["mois"].between(1, int(horizon))]
+            besoins_pieces = {}
+            for _, r in df_hor.iterrows():
+                pcs = p2pcs.get(r["id_produit"], set())
+                for pid in pcs:
+                    besoins_pieces[pid] = besoins_pieces.get(pid, 0) + int(r["qte"])  # qty=1 par défaut
+
+            if st.button("📦 Alimenter l’onglet 🛒 avec ces besoins", key="prodcal_push"):
+                # format attendu : {id_piece: {"besoin_total": int}}
+                st.session_state["besoins_courants"] = {k: {"besoin_total": int(v)} for k, v in besoins_pieces.items()}
+                st.success(f"Besoins pour {len(besoins_pieces)} pièces envoyés à l’onglet 🛒.")
+
+
+
+# ============ ONGLET 6 : Passer une commande ============
+with onglets[5]:
     st.subheader("🛒 Passer une commande (manuelle)")
 
     st.caption("Sélectionne les pièces à commander, choisis le fournisseur pour chaque ligne, ajuste les quantités, puis clique sur *Créer la/les commande(s)*. Les réceptions s'appliquent automatiquement à la date prévue.")
