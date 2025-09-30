@@ -244,6 +244,50 @@ def ensure_production_tables():
     conn.commit(); conn.close()
 
 
+def ensure_bom_table():
+    conn = open_conn(); cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bom_quantities (
+            id_produit TEXT,
+            id_piece   TEXT,
+            qty_per_unit REAL DEFAULT 1,
+            PRIMARY KEY (id_produit, id_piece),
+            FOREIGN KEY (id_produit) REFERENCES produits(id_produit),
+            FOREIGN KEY (id_piece)   REFERENCES pieces(id_piece)
+        )
+    """)
+    conn.commit(); conn.close()
+
+def _monthly_capacity_from_calendar(year:int, hours_per_day:float=8.0, holidays:list[str]|None=None) -> pd.DataFrame:
+    """
+    Calcule la capacité mensuelle = (jours ouvrables du mois - congés) * heures/jour.
+    'holidays' = liste de dates 'YYYY-MM-DD' à exclure.
+    """
+    holidays = set(holidays or [])
+    recs = []
+    for m in range(1,13):
+        # jours ouvrables (lun..ven)
+        rng = pd.date_range(f"{year}-{m:02d}-01", periods=31, freq="D")
+        rng = rng[(rng.month == m) & (rng.weekday < 5)]
+        bdays = sum(1 for d in rng if d.strftime("%Y-%m-%d") not in holidays)
+        recs.append({"annee": year, "mois": m, "heures_disponibles": float(bdays)*float(hours_per_day)})
+    return pd.DataFrame(recs)
+
+
+def _min_leadtime_by_piece() -> dict:
+    conn = open_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT id_piece, MIN(delai_livraison_jours) AS lt
+            FROM fournisseurs
+            GROUP BY id_piece
+        """, conn)
+    finally:
+        conn.close()
+    return {r["id_piece"]: int(r["lt"]) for _, r in df.iterrows()} if not df.empty else {}
+
+
+
 # >>> AJOUT : réception auto des lignes dont la date prévue est passée
 def auto_reception_commandes():
     today = datetime.today().strftime("%Y-%m-%d")
@@ -515,6 +559,7 @@ if "db_init_done" not in st.session_state:
     ensure_db_indexes()
     ensure_po_tables()
     ensure_production_tables()     # <<< AJOUT
+    ensure_bom_table()   # <<< AJOUT
     st.session_state["db_init_done"] = True
 
 
@@ -1058,22 +1103,27 @@ def choisir_fournisseur_top3(
     except Exception:
         nom_map = {}
 
-    def _coerce_record(id_piece: str, infos) -> tuple[int, str]:
+    def _coerce_record(id_piece: str, infos):
         if isinstance(infos, dict):
             q = int(infos.get("besoin_total", 0) or 0)
             nom = infos.get("nom_piece") or nom_map.get(id_piece, id_piece)
+            dcs = infos.get("date_commande_suggeree")  # <<< optionnel
+            db  = infos.get("date_besoin")             # <<< optionnel
         else:
-            q = int(infos or 0)
-            nom = nom_map.get(id_piece, id_piece)
-        return q, nom
+            q = int(infos or 0); nom = nom_map.get(id_piece, id_piece); dcs = None; db = None
+        return q, nom, dcs, db
 
+
+        # --- suite : construit les lignes par pièce (Top 3 fournisseurs) ---
     rows = []
     for id_piece, infos in (besoins or {}).items():
-        quantite, nom_piece = _coerce_record(id_piece, infos)
+        # normalise (quantité, nom, dates éventuelles)
+        quantite, nom_piece, dcs, db = _coerce_record(id_piece, infos)
         if quantite <= 0:
             continue
 
-        dfp = fournisseurs[fournisseurs["id_piece"] == id_piece]
+        # sous-ensemble fournisseurs de cette pièce + filtres
+        dfp = fournisseurs[fournisseurs["id_piece"] == id_piece].copy()
         if filtre_fournisseur:
             dfp = dfp[dfp["nom_fournisseur"] == filtre_fournisseur]
         if filtre_prix_max is not None:
@@ -1083,6 +1133,7 @@ def choisir_fournisseur_top3(
         if dfp.empty:
             continue
 
+        # tri selon stratégie
         if strategie == "prix":
             dfp = dfp.sort_values("prix_unitaire", kind="mergesort")
         elif strategie == "delai":
@@ -1091,19 +1142,34 @@ def choisir_fournisseur_top3(
             dfp = _score_equilibre(dfp).sort_values("score", kind="mergesort")
 
         top = dfp.head(3).reset_index(drop=True)
-        row = {"id_piece": id_piece, "nom_piece": nom_piece, "besoin_total": int(quantite)}
-        for i in range(len(top)):
-            row[f"fournisseur_{i+1}"] = str(top.loc[i, "nom_fournisseur"])
-            row[f"prix_{i+1}"] = float(top.loc[i, "prix_unitaire"])
-            row[f"delai_{i+1}"] = int(top.loc[i, "delai_livraison_jours"])
-        for i in range(len(top), 3):
-            row[f"fournisseur_{i+1}"] = None
-            row[f"prix_{i+1}"] = None
-            row[f"delai_{i+1}"] = None
+
+        # ligne résultat
+        row = {
+            "id_piece": id_piece,
+            "nom_piece": nom_piece,
+            "besoin_total": int(quantite),
+        }
+        # (optionnel) dates poussées depuis le calendrier
+        if dcs: row["date_commande_suggeree"] = dcs
+        if db:  row["date_besoin"] = db
+
+        # fournisseurs 1..3
+        for i in range(3):
+            if i < len(top):
+                row[f"fournisseur_{i+1}"] = str(top.loc[i, "nom_fournisseur"])
+                row[f"prix_{i+1}"] = float(top.loc[i, "prix_unitaire"])
+                row[f"delai_{i+1}"] = int(top.loc[i, "delai_livraison_jours"])
+            else:
+                row[f"fournisseur_{i+1}"] = None
+                row[f"prix_{i+1}"] = None
+                row[f"delai_{i+1}"] = None
+
         rows.append(row)
 
+    # DataFrame final
     df = pd.DataFrame(rows)
-    # Ajouter stock_disponible
+
+    # --- enrichissements (stock réel, en_attente, stock_projeté) ---
     try:
         stk = _get_stock_df()[["id_piece", "stock_disponible"]]
         df = df.merge(stk, on="id_piece", how="left")
@@ -1111,8 +1177,7 @@ def choisir_fournisseur_top3(
         df["stock_disponible"] = 0
     df["stock_disponible"] = df["stock_disponible"].fillna(0).astype(int)
 
-
-    # (si pas déjà fait plus haut) enrichir avec “en_attente” / “prochaine_reception”
+    # en_attente & prochaine_reception depuis les commandes en transit
     try:
         onord = get_on_order_summary()
         if not onord.empty:
@@ -1126,11 +1191,12 @@ def choisir_fournisseur_top3(
     df["en_attente"] = df["en_attente"].fillna(0).astype(int)
     df["prochaine_reception"] = df["prochaine_reception"].fillna("")
 
-    # >>> AJOUT : stock projeté
+    # stock projeté = stock dispo + en attente
     df["stock_projeté"] = (df["stock_disponible"].fillna(0).astype(int)
                            + df["en_attente"].fillna(0).astype(int))
 
     return df
+
 
 
 
@@ -2974,13 +3040,67 @@ with onglets[4]:   # attention: l'indice doit correspondre à ta liste réelle
     with colC:
         cap_default = st.number_input("Capacité standard par mois (heures)", min_value=0.0, value=160.0, step=10.0, key="prodcal_capdef")
 
-    # 1) Demande annuelle par produit (baseline historique)
-    df_dmd = _baseline_annual_demand(int(annee), float(croissance))
-    if df_dmd.empty:
-        st.info("Aucun historique : renseigne la demande annuelle manuellement dans le tableau ci-dessous.")
-        # créer un squelette avec tous les produits
-        conn = open_conn(); df_prod = pd.read_sql("SELECT id_produit, nom_produit FROM produits", conn); conn.close()
-        df_dmd = df_prod.copy(); df_dmd["annual_units"] = 0
+
+    # 1) Demande annuelle par produit (éditable ; baseline = historique × (1+croissance)
+    df_dmd_base = _baseline_annual_demand(int(annee), float(croissance))  # colonnes: id_produit, annual_units (peut être vide)
+
+    # liste des produits (pour inclure aussi ceux sans historique)
+    conn = open_conn()
+    df_prod = pd.read_sql("SELECT id_produit, nom_produit FROM produits", conn)
+    conn.close()
+
+    # fusion baseline + tous produits
+    df_dmd = df_prod.merge(df_dmd_base, on="id_produit", how="left")
+    df_dmd["annual_units"] = df_dmd["annual_units"].fillna(0).astype("int64")
+
+    st.markdown("#### Demande annuelle par produit (éditable)")
+    if df_dmd["annual_units"].sum() == 0:
+        st.caption("Pas d'historique détecté : renseigne les quantités manuellement ci-dessous.")
+
+    # éditeur unique utilisé plus loin pour le plan
+    df_dmd_edit = st.data_editor(
+        df_dmd[["id_produit","nom_produit","annual_units"]],
+        use_container_width=True, key="prodcal_dmd_edit"
+    )
+
+
+    # 4bis) BOM (quantités par produit -> pièce)
+    st.markdown("#### Nomenclature (BOM) — quantités par pièce (éditable)")
+    # Base de la BOM “déduite” (1 par défaut) : produit -> pièces via sous_assemblages/pieces
+    conn = open_conn()
+    df_bom_base = pd.read_sql("""
+        SELECT sa.id_produit, p.nom_produit, pi.id_piece, pi.nom_piece
+        FROM sous_assemblages sa
+        JOIN produits p ON p.id_produit = sa.id_produit
+        JOIN pieces pi ON pi.id_sous_assemblage = sa.id_sous_assemblage
+        ORDER BY sa.id_produit, pi.id_piece
+    """, conn)
+    # Quantités déjà définies
+    df_bom_q = pd.read_sql("SELECT id_produit, id_piece, qty_per_unit FROM bom_quantities", conn)
+    conn.close()
+    df_bom = df_bom_base.merge(df_bom_q, on=["id_produit","id_piece"], how="left")
+    # version robuste (recommandée)
+    df_bom["qty_per_unit"] = (
+        pd.to_numeric(df_bom["qty_per_unit"], errors="coerce")
+        .fillna(1.0)
+        .astype(float)
+    )
+
+
+    df_bom_edit = st.data_editor(
+        df_bom[["id_produit","nom_produit","id_piece","nom_piece","qty_per_unit"]],
+        use_container_width=True, key="prodcal_bom_edit"
+    )
+    if st.button("💾 Sauvegarder la BOM", key="prodcal_bom_save"):
+        conn = open_conn(); cur = conn.cursor()
+        cur.execute("DELETE FROM bom_quantities")
+        cur.executemany("""INSERT INTO bom_quantities (id_produit, id_piece, qty_per_unit)
+                        VALUES (?,?,?)""",
+                        [(r["id_produit"], r["id_piece"], float(r["qty_per_unit"]))
+                        for _, r in df_bom_edit.iterrows()])
+        conn.commit(); conn.close()
+        st.success("BOM sauvegardée.")
+
 
     # 2) Heures standard par produit (éditable)
     std_map = _load_std_hours()
@@ -2997,68 +3117,122 @@ with onglets[4]:   # attention: l'indice doit correspondre à ta liste réelle
         _save_std_hours(df_std_edit[["id_produit","heures_unite"]])
         st.success("Heures standard sauvegardées.")
 
+
     # 3) Capacité mensuelle (éditable)
     st.markdown("#### Capacité mensuelle (heures, éditable)")
-    df_cap = _monthly_capacity(int(annee), float(cap_default))
+    auto_cap = st.checkbox("Calculer automatiquement depuis calendrier (ouvrables × h/jour)", value=True, key="prodcal_cap_auto")
+    if auto_cap:
+        hpd = st.number_input("Heures par jour ouvrable", min_value=1.0, value=8.0, step=0.5, key="prodcal_hpd")
+        st.caption("Saisis les congés (format YYYY-MM-DD), un par ligne :")
+        holotxt = st.text_area("Jours fériés / fermetures", value="", key="prodcal_holidays")
+        holidays = [s.strip() for s in holotxt.splitlines() if s.strip()]
+        df_cap = _monthly_capacity_from_calendar(int(annee), float(hpd), holidays)
+    else:
+        df_cap = _monthly_capacity(int(annee), float(cap_default))
     df_cap = st.data_editor(df_cap, use_container_width=True, key="prodcal_cap_edit")
 
-    # 4) Demande annuelle (éditable)
-    st.markdown("#### Demande annuelle par produit (éditable)")
-    df_dmd = df_dmd.merge(df_prod, on="id_produit", how="right")
-    df_dmd = df_dmd[["id_produit","nom_produit","annual_units"]].fillna({"annual_units":0}).astype({"annual_units":"int64"})
-    df_dmd_edit = st.data_editor(df_dmd, use_container_width=True, key="prodcal_dmd_edit")
 
-    # 5) Lancer le lissage
+
+    # 4) Lancer le lissage
     if st.button("▶️ Générer le calendrier lissé", key="prodcal_run"):
         std_map2 = {r["id_produit"]: float(r["heures_unite"]) for _, r in df_std_edit.iterrows()}
-        dmd_map = {r["id_produit"]: int(r["annual_units"]) for _, r in df_dmd_edit.iterrows()}
-        cap_map = {int(r["mois"]): float(r["heures_disponibles"]) for _, r in df_cap.iterrows()}
+        dmd_map  = {r["id_produit"]: int(r["annual_units"]) for _, r in df_dmd_edit.iterrows()}
+        cap_map  = {int(r["mois"]): float(r["heures_disponibles"]) for _, r in df_cap.iterrows()}
 
         plan = _level_load_schedule(dmd_map, std_map2, cap_map)  # (mois,id_produit,qte,heures)
 
         if plan.empty:
             st.warning("Plan vide : vérifie que la demande > 0 et que la capacité > 0.")
         else:
-            # Enregistrer dans production_calendar (optionnel ; sinon juste afficher)
+            # 1) enregistrer le plan (optionnel)
             conn = open_conn(); cur = conn.cursor()
             cur.execute("DELETE FROM production_calendar WHERE annee=?", (int(annee),))
             cur.executemany("""INSERT INTO production_calendar (annee, mois, id_produit, qte, heures)
-                               VALUES (?,?,?,?,?)""",
+                            VALUES (?,?,?,?,?)""",
                             [(int(annee), int(r["mois"]), r["id_produit"], int(r["qte"]), float(r["heures"]))
-                             for _, r in plan.iterrows()])
+                            for _, r in plan.iterrows()])
             conn.commit(); conn.close()
 
-            # Affichage pivot (mois en colonnes)
+            # 2) affichage pivot (unités/mois)
             pivot = plan.pivot_table(index="id_produit",
-                                     columns="mois",
-                                     values="qte", aggfunc="sum", fill_value=0).sort_index()
+                                    columns="mois",
+                                    values="qte", aggfunc="sum", fill_value=0).sort_index()
             st.markdown("#### 📊 Calendrier (unités par mois)")
             st.dataframe(pivot, use_container_width=True)
 
-            # Résumé charge vs capacité
+            # 3) charge vs capacité (heures)
             charge = plan.groupby("mois")["heures"].sum().reindex(range(1,13), fill_value=0.0)
-            cap = pd.Series(cap_map).reindex(range(1,13), fill_value=0.0)
-            df_rc = pd.DataFrame({"heures_planifiées": charge, "heures_disponibles": cap})
+            cap    = pd.Series(cap_map).reindex(range(1,13), fill_value=0.0)
+            df_rc  = pd.DataFrame({"heures_planifiées": charge, "heures_disponibles": cap})
             st.markdown("#### ⚖️ Charge vs Capacité (heures)")
             st.dataframe(df_rc, use_container_width=True)
 
-            # 6) ⇨ Préparer l'achat pièces pour les X prochains mois
-            st.markdown("#### ⇨ Générer les besoins pièces à partir du plan")
+            # 4) === A3 : besoins pièces à partir de la BOM + push vers 🛒 ===
+            # map produit -> (piece, qty_per_unit)
+            conn = open_conn()
+            df_bom_q = pd.read_sql("SELECT id_produit, id_piece, qty_per_unit FROM bom_quantities", conn)
+            conn.close()
+            bom_map = {}
+            for _, r in df_bom_q.iterrows():
+                bom_map.setdefault(r["id_produit"], []).append((r["id_piece"], float(r["qty_per_unit"])))
+
+            st.markdown("#### ⇨ Générer les besoins pièces à partir du plan (BOM)")
             horizon = st.slider("Horizon (mois) pour alimenter 🛒", 1, 6, 3, 1, key="prodcal_horizon")
-            # map produit->pieces (1:1 par défaut; si tu ajoutes des quantités de nomenclature, on les intégrera ici)
-            p2pcs = _product_to_pieces_map()
-            # besoins pièces cumulés sur l'horizon
+
+            # on cumule les besoins pièces sur les 'horizon' premiers mois du plan
             df_hor = plan[plan["mois"].between(1, int(horizon))]
             besoins_pieces = {}
             for _, r in df_hor.iterrows():
-                pcs = p2pcs.get(r["id_produit"], set())
-                for pid in pcs:
-                    besoins_pieces[pid] = besoins_pieces.get(pid, 0) + int(r["qte"])  # qty=1 par défaut
+                for (pid, qpu) in bom_map.get(r["id_produit"], []):
+                    besoins_pieces[pid] = besoins_pieces.get(pid, 0) + int(round(r["qte"] * qpu))
 
             if st.button("📦 Alimenter l’onglet 🛒 avec ces besoins", key="prodcal_push"):
-                # format attendu : {id_piece: {"besoin_total": int}}
+                # format attendu en 🛒 : {id_piece: {"besoin_total": int}}
                 st.session_state["besoins_courants"] = {k: {"besoin_total": int(v)} for k, v in besoins_pieces.items()}
-                st.success(f"Besoins pour {len(besoins_pieces)} pièces envoyés à l’onglet 🛒.")
+                st.success(f"Besoins (avec BOM) pour {len(besoins_pieces)} pièces envoyés à l’onglet 🛒.")
+
+            # 5) === C2 : pré-commande — date de besoin & date de commande suggérée ===
+            st.markdown("#### 🪪 Pré-commande (dates) — premières arrivées nécessaires par pièce")
+
+            # helper nécessaire en amont dans tes helpers: _min_leadtime_by_piece()
+            # (si pas déjà ajouté, voir message précédent)
+            min_lt = _min_leadtime_by_piece()
+
+            # besoins par pièce/mois (avec la BOM)
+            df_need = []
+            for _, r in plan.iterrows():
+                for (pid, qpu) in bom_map.get(r["id_produit"], []):
+                    units = int(round(r["qte"] * qpu))
+                    if units <= 0:
+                        continue
+                    df_need.append({"mois": int(r["mois"]), "id_piece": pid, "units": units})
+            df_need = pd.DataFrame(df_need)
+
+            if df_need.empty:
+                st.info("Aucun besoin composant détecté sur le plan courant.")
+            else:
+                grp = df_need.groupby("id_piece")["mois"].min().reset_index().rename(columns={"mois":"premier_mois"})
+                grp["date_besoin"] = grp["premier_mois"].apply(lambda m: f"{annee}-{m:02d}-01")
+                grp["delai_min_j"] = grp["id_piece"].map(min_lt).fillna(14).astype(int)
+                grp["date_commande_suggeree"] = pd.to_datetime(grp["date_besoin"]) - pd.to_timedelta(grp["delai_min_j"], unit="D")
+                grp["date_commande_suggeree"] = grp["date_commande_suggeree"].dt.strftime("%Y-%m-%d")
+
+                st.dataframe(
+                    grp[["id_piece","premier_mois","date_besoin","delai_min_j","date_commande_suggeree"]],
+                    use_container_width=True
+                )
+
+                if st.button("🛎️ Pré-remplir les dates de commande en 🛒", key="prodcal_push_dates"):
+                    # réutilise les quantités déjà calculées par A3
+                    besoins_dict = {k: {"besoin_total": int(v)} for k, v in besoins_pieces.items()}
+                    for _, r in grp.iterrows():
+                        pid = r["id_piece"]
+                        if pid in besoins_dict:
+                            besoins_dict[pid]["date_commande_suggeree"] = r["date_commande_suggeree"]
+                            besoins_dict[pid]["date_besoin"] = r["date_besoin"]
+                    st.session_state["besoins_courants"] = besoins_dict
+                    st.success("Besoins + dates suggérées envoyés à l’onglet 🛒.")
+
 
 
 
